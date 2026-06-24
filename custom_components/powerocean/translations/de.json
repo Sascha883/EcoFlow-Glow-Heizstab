@@ -1,0 +1,81 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Bitte geben Sie unten Ihre PowerOcean-Geräteinformationen ein:",
+        "data": {
+          "device_id": "Seriennummer des Wechselrichters (wie in der EcoFlow-App angezeigt)",
+          "email": "E-Mail-Adresse",
+          "password": "Passwort",
+          "model_id": "PowerOcean-Modell"
+        }
+      },
+      "device_options": {
+        "description": "Geräteoptionen konfigurieren:",
+        "data": {
+          "friendly_name": "Gerätename",
+          "scan_interval": "Aktualisierungsintervall (in Sekunden)",
+          "powerglow_only": "Nur PowerGlow-Sensoren laden (Heizstab)"
+        }
+      },
+      "reconfigure": {
+        "description": "PowerOcean-Zugangsdaten aktualisieren.",
+        "data": {
+          "device_id": "Seriennummer des Wechselrichters (wie in der EcoFlow-App angezeigt)",
+          "email": "E-Mail-Adresse",
+          "password": "Passwort",
+          "model_id": "PowerOcean-Modell"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Verbindung fehlgeschlagen. Bitte prüfen Sie Ihre Zugangsdaten.",
+      "invalid_auth": "Ungültige Authentifizierung",
+      "unknown": "Unerwarteter Fehler"
+    },
+    "abort": {
+      "already_configured": "Dieses Gerät ist bereits konfiguriert.",
+      "reconfiguration_completed": "Gerätekonfiguration wurde aktualisiert. Die Integration wird neu geladen."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Einstellungen",
+        "menu_options": {
+          "grundeinstellungen": "Grundeinstellungen",
+          "pv_ueberschuss": "PV-Überschuss",
+          "regellogik": "Regellogik"
+        }
+      },
+      "grundeinstellungen": {
+        "title": "Grundeinstellungen",
+        "data": {
+          "friendly_name": "Gerätename",
+          "scan_interval": "Aktualisierungsintervall (in Sekunden)",
+          "powerglow_only": "Nur PowerGlow-Sensoren laden (Heizstab)"
+        }
+      },
+      "pv_ueberschuss": {
+        "title": "PV-Überschuss",
+        "description": "Steuert den Heizstab automatisch anhand des PV-Überschusses. Der gewählte Sensor muss die aktuell verfügbare PV-Leistung in Watt liefern.",
+        "data": {
+          "pv_enabled": "PV-Überschuss-Regelung aktivieren",
+          "pv_power_sensor": "PV-Überschuss-Sensor (W)",
+          "pv_min_surplus": "Mindestüberschuss zum Einschalten (W)",
+          "pv_max_power": "Maximale Heizleistung",
+          "pv_max_temp": "Abschalt-Temperatur (°C) – PV stoppt wenn Wasser diese Temperatur erreicht (Wiedereinschalten -5 K)"
+        }
+      },
+      "regellogik": {
+        "title": "Regellogik",
+        "description": "Zeitverhalten und Schrittweite der PV-Überschuss-Regelung anpassen.",
+        "data": {
+          "pv_ramp_step": "Rampe – Leistungsänderung pro Schritt (W)",
+          "pv_check_interval": "Rampen-Intervall (s) – Dauer pro Schritt",
+          "pv_startup_delay": "Anlaufverzögerung nach HA-Start (s)"
+        }
+      }
+    }
+  }
+}
