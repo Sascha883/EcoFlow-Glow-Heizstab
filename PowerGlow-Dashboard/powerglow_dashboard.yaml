@@ -1,0 +1,311 @@
+# ============================================================
+#  PowerGlow Heizstab – Lovelace Dashboard
+#
+#  Importieren: Einstellungen → Dashboards → Dashboard hinzufügen
+#               → (leeres Dashboard) → ⋮ → Raw-Konfigurationseditor
+#               → diesen Inhalt einfügen → Speichern
+#
+#  Entity-IDs wurden aus HA Developer Tools abgelesen (Gerät: Heizung / PowerGlow).
+#  PV-Sensor: Ersetze "sensor.DEIN_PV_SENSOR" durch deine PV-Überschuss Entity-ID.
+# ============================================================
+
+title: PowerGlow Heizstab
+views:
+
+  # ════════════════════════════════════════════════════════════
+  #  TAB 1 – ÜBERSICHT
+  # ════════════════════════════════════════════════════════════
+  - title: Übersicht
+    path: powerglow
+    icon: mdi:water-boiler
+
+    cards:
+
+      # ──────────────────────────────────────────────────────
+      #  HEIZSTAB STATUS
+      # ──────────────────────────────────────────────────────
+      - type: vertical-stack
+        cards:
+
+          - type: entities
+            title: Heizstab Status
+            icon: mdi:water-boiler
+            entities:
+              - entity: switch.powerglow_powerglow_ein_aus
+                name: Ein / Aus
+                icon: mdi:power
+              - entity: select.powerglow_betriebsmodus
+                name: Betriebsmodus
+                icon: mdi:tune
+              - type: divider
+              - entity: sensor.powerglow_temp
+                name: Wassertemperatur (IST)
+                icon: mdi:thermometer-water
+              - entity: sensor.powerglow_targettemp
+                name: Zieltemperatur (Manuell)
+                icon: mdi:thermometer-chevron-up
+              - entity: sensor.heizung_powerglow_zieltemperatur_smart
+                name: Zieltemperatur (Smart)
+                icon: mdi:thermometer-chevron-up
+              - type: divider
+              - entity: sensor.powerglow_heatingpower
+                name: Aktuelle Heizleistung
+                icon: mdi:lightning-bolt
+              - entity: sensor.powerglow_targetpower
+                name: Zielleistung
+                icon: mdi:target
+
+          - type: horizontal-stack
+            cards:
+              - type: gauge
+                entity: sensor.powerglow_temp
+                name: Wasser °C
+                min: 0
+                max: 90
+                needle: true
+                severity:
+                  green: 0
+                  yellow: 55
+                  red: 75
+
+              - type: gauge
+                entity: sensor.powerglow_heatingpower
+                name: Heizleistung W
+                min: 0
+                max: 9000
+                needle: true
+                severity:
+                  green: 0
+                  yellow: 3500
+                  red: 7000
+
+          - type: history-graph
+            title: Heizleistung & Wassertemperatur (24h)
+            hours_to_show: 24
+            entities:
+              - entity: sensor.powerglow_heatingpower
+                name: Heizleistung
+              - entity: sensor.powerglow_temp
+                name: Wassertemperatur
+
+      # ──────────────────────────────────────────────────────
+      #  PV-ÜBERSCHUSS REGELUNG
+      # ──────────────────────────────────────────────────────
+      - type: vertical-stack
+        cards:
+
+          - type: entities
+            title: PV-Überschuss Regelung
+            icon: mdi:solar-power
+            entities:
+              - entity: sensor.heizung_powerglow_pv_uberschuss
+                name: PV-Überschuss (konfiguriert)
+                icon: mdi:solar-power-variant
+              - entity: sensor.powerglow_targetpower
+                name: Zielleistung (aktiv)
+                icon: mdi:target
+              - type: divider
+              - entity: sensor.powerglow_hrpwr
+                name: Gesamtleistung Heizstab
+                icon: mdi:flash
+              - entity: sensor.powerglow_frompv
+                name: PV-Anteil
+                icon: mdi:solar-power
+              - entity: sensor.powerglow_fromgrid
+                name: Netzanteil
+                icon: mdi:transmission-tower-import
+              - entity: sensor.powerglow_frombat
+                name: Batterieanteil
+                icon: mdi:battery-charging
+
+          - type: history-graph
+            title: Leistungsquellen (24h)
+            hours_to_show: 24
+            entities:
+              - entity: sensor.powerglow_hrpwr
+                name: Gesamt
+              - entity: sensor.powerglow_frompv
+                name: PV-Anteil
+              - entity: sensor.powerglow_fromgrid
+                name: Netzanteil
+              - entity: sensor.powerglow_frombat
+                name: Batterieanteil
+
+      # ──────────────────────────────────────────────────────
+      #  ENERGIE & STATISTIKEN
+      # ──────────────────────────────────────────────────────
+      - type: vertical-stack
+        cards:
+
+          - type: statistics-graph
+            title: Leistung – letzte 7 Tage
+            entities:
+              - entity: sensor.powerglow_hrpwr
+                name: Heizstab gesamt
+              - entity: sensor.powerglow_frompv
+                name: PV-Anteil
+              - entity: sensor.powerglow_fromgrid
+                name: Netzanteil
+            stat_types:
+              - mean
+              - max
+            days_to_show: 7
+            chart_type: bar
+
+          - type: history-graph
+            title: Wassertemperatur – letzte 24 h
+            hours_to_show: 24
+            entities:
+              - entity: sensor.powerglow_temp
+                name: Wassertemperatur
+
+  # ════════════════════════════════════════════════════════════
+  #  TAB 2 – STEUERUNG
+  # ════════════════════════════════════════════════════════════
+  - title: Steuerung
+    path: powerglow-steuerung
+    icon: mdi:cog
+
+    cards:
+
+      - type: entities
+        title: Betrieb
+        icon: mdi:power-settings
+        entities:
+          - entity: switch.powerglow_powerglow_ein_aus
+            name: Heizstab Ein/Aus
+            icon: mdi:power
+          - entity: select.powerglow_betriebsmodus
+            name: Betriebsmodus
+            icon: mdi:tune
+
+      - type: entities
+        title: Manueller Modus
+        icon: mdi:hand-back-right
+        entities:
+          - entity: number.powerglow_zielleistung
+            name: Heizleistung (Ziel)
+            icon: mdi:lightning-bolt
+          - entity: number.powerglow_zieltemperatur
+            name: Zieltemperatur
+            icon: mdi:thermometer
+
+      - type: entities
+        title: Smart Modus – Zeitplan
+        icon: mdi:clock-time-eight-outline
+        entities:
+          - entity: time.heizung_powerglow_zeitplan_timer_1
+            name: Timer 1 – Uhrzeit
+            icon: mdi:clock-start
+          - entity: number.heizung_powerglow_temperatur_timer_1
+            name: Timer 1 – Temperatur
+            icon: mdi:thermometer-chevron-up
+          - type: divider
+          - entity: time.heizung_powerglow_zeitplan_timer_2
+            name: Timer 2 – Uhrzeit
+            icon: mdi:clock-start
+          - entity: number.heizung_powerglow_temperatur_timer_2
+            name: Timer 2 – Temperatur
+            icon: mdi:thermometer-chevron-up
+
+      - type: entities
+        title: Tank
+        icon: mdi:storage-tank
+        entities:
+          - entity: select.heizung_powerglow_tankvolumen
+            name: Tankgröße
+            icon: mdi:storage-tank
+          - entity: select.heizung_powerglow_typ_wassertank
+            name: Tanktyp
+            icon: mdi:water-thermometer
+          - entity: number.heizung_powerglow_tankvolumen_anpassen
+            name: Tankvolumen (manuell)
+            icon: mdi:tune
+
+  # ════════════════════════════════════════════════════════════
+  #  TAB 3 – DIAGNOSE
+  # ════════════════════════════════════════════════════════════
+  - title: Diagnose
+    path: powerglow-diagnose
+    icon: mdi:magnify
+
+    cards:
+
+      - type: entities
+        title: Gerätezustand (HEATING_ROD_PARAM_REPORT)
+        icon: mdi:database
+        entities:
+          - entity: sensor.powerglow_runflag
+            name: runFlag (Betrieb 0/1)
+            icon: mdi:toggle-switch
+          - entity: sensor.powerglow_mode
+            name: mode (Betriebsmodus)
+            icon: mdi:tune
+          - entity: sensor.powerglow_temp
+            name: temp (Wassertemperatur)
+            icon: mdi:thermometer-water
+          - entity: sensor.powerglow_heatingpower
+            name: heatingPower (Heizleistung)
+            icon: mdi:lightning-bolt
+          - entity: sensor.powerglow_targetpower
+            name: targetPower (Zielleistung)
+            icon: mdi:target
+          - entity: sensor.powerglow_targettemp
+            name: targetTemp (Ziel Manuell)
+            icon: mdi:thermometer
+          - entity: sensor.heizung_powerglow_zieltemperatur_smart
+            name: smartTargetTemp (Ziel Smart)
+            icon: mdi:thermometer
+          - entity: sensor.heizung_powerglow_haltewarme_setpoint
+            name: keepWarmTemp (Haltewärme)
+            icon: mdi:thermometer-low
+          - entity: sensor.powerglow_watertankvolume
+            name: waterTankVolume (Tankvolumen L)
+            icon: mdi:storage-tank
+          - entity: sensor.heizung_powerglow_tanktype
+            name: tankType (Tanktyp)
+            icon: mdi:water-thermometer
+          - entity: sensor.heizung_powerglow_einschaltzeit_smart
+            name: scheduleTime (Einschaltzeit)
+            icon: mdi:clock
+          - entity: sensor.heizung_powerglow_scheduletime1
+            name: scheduleTime1 (Timer 1 Minuten)
+            icon: mdi:clock-start
+          - entity: sensor.heizung_powerglow_scheduletime2
+            name: scheduleTime2 (Timer 2 Minuten)
+            icon: mdi:clock-start
+          - entity: sensor.heizung_powerglow_scheduleslot1temp
+            name: scheduleSlot1Temp (Timer 1 °C)
+            icon: mdi:thermometer
+          - entity: sensor.heizung_powerglow_scheduleslot2temp
+            name: scheduleSlot2Temp (Timer 2 °C)
+            icon: mdi:thermometer
+          - entity: sensor.powerglow_runstat
+            name: runStat
+            icon: mdi:chart-bar
+          - entity: sensor.powerglow_errorcode
+            name: errorCode
+            icon: mdi:alert-circle
+          - entity: sensor.powerglow_selfcheckpercent
+            name: selfcheckPercent
+            icon: mdi:progress-check
+          - entity: sensor.powerglow_hrsn
+            name: hrSn (Seriennummer)
+            icon: mdi:identifier
+
+      - type: entities
+        title: Energie (HEATING_ROD_ENERGY_STREAM_REPORT)
+        icon: mdi:lightning-bolt
+        entities:
+          - entity: sensor.powerglow_hrpwr
+            name: hrPwr (Gesamt)
+            icon: mdi:flash
+          - entity: sensor.powerglow_frompv
+            name: fromPv (PV-Anteil)
+            icon: mdi:solar-power
+          - entity: sensor.powerglow_fromgrid
+            name: fromGrid (Netzanteil)
+            icon: mdi:transmission-tower-import
+          - entity: sensor.powerglow_frombat
+            name: fromBat (Batterieanteil)
+            icon: mdi:battery-charging
