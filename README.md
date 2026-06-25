@@ -18,7 +18,6 @@
 
 | Funktion | Beschreibung |
 |---|---|
-| **Echtzeit-MQTT** | Push-Daten ohne Polling – sofortige Statusaktualisierung |
 | **3 Betriebsmodi** | Manuell, Smart (Zeitplan), PV-Ueberschuss |
 | **PV-Ueberschuss-Regelung** | Automatische Leistungsanpassung anhand eines beliebigen HA-Sensors |
 | **Sanfte Leistungsrampe** | Schrittweise Anpassung konfigurierbar (Standard: 100 W / 10 s) |
