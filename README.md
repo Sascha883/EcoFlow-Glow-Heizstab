@@ -45,7 +45,7 @@
 ### Via HACS (empfohlen)
 
 1. HACS > Drei-Punkte-Menu > **Benutzerdefinierte Repositories**
-2. URL eingeben: `https://github.com/Sascha883/EcoFlow-PowerGlow`
+2. URL eingeben: `[https://github.com/Sascha883/EcoFlow-Glow-Heizstab]
 3. Kategorie: **Integration** > Hinzufuegen
 4. **PowerOcean** in HACS suchen und installieren
 5. Home Assistant neu starten
