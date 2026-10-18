@@ -147,6 +147,8 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
         # field25=6 → Manueller Modus, field25=8 → Smart Modus.
         # Used by async_send_command guards to avoid redundant commands.
         self._actual_device_mode: int | None = None
+        # Last run state reported by the device itself (for cmd_id=97 keepalive).
+        self._reported_run_flag: int = 0
         self._persist_task: asyncio.Task | None = None
         self._pv_task: asyncio.Task | None = None
         self._pv_config: dict = {}
@@ -245,32 +247,67 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
             await self.hass.async_add_executor_job(client.stop)
         LOGGER.info("PowerGlow %s: MQTT teardown complete", self.api.sn)
 
-    # How often to send cmd_id=17 to re-sync state with the EcoFlow app.
-    # The device already reports every ~60 s on its own, but this catches
-    # manual changes made in the EcoFlow app more quickly.
-    _STATUS_POLL_INTERVAL_S: float = 300.0  # 5 minutes
+    # How often to send cmd_id=17 (full status query).
+    # The EcoFlow cloud/app sends this roughly every 5 min, but the device's
+    # autonomous cmd_id=1 reports are NOT guaranteed without an active app
+    # session, so we poll more often.
+    _STATUS_POLL_INTERVAL_S: float = 60.0
+
+    # How often to send cmd_id=97 (app keepalive).
+    # While the EcoFlow app is open it sends cmd_id=97 every ~3 s. The device
+    # only streams live telemetry (cmd_id=33/34: heatingPower, hrPwr, temp)
+    # while it sees these keepalives. Without them the live values freeze
+    # until someone opens the app again.
+    _KEEPALIVE_INTERVAL_S: float = 10.0
 
     async def _persist_loop(self) -> None:
         """
-        Background task: periodically send cmd_id=17 (status query) to the device.
+        Background task: keep the device's live-data stream alive.
 
-        After startup we wait 3 s (subscriptions settle) then request an
-        immediate status report.  Subsequently we re-poll every
-        _STATUS_POLL_INTERVAL_S seconds so that changes made in the EcoFlow
-        app (mode, targetTemp, targetPower) are reflected in HA within
-        at most that interval.
+        - cmd_id=97 keepalive every _KEEPALIVE_INTERVAL_S seconds
+          (emulates an open EcoFlow app session -> device keeps streaming)
+        - cmd_id=17 full status query every _STATUS_POLL_INTERVAL_S seconds
+          (re-syncs mode/targetTemp/targetPower/heatingPower)
 
-        The device also sends autonomous cmd_id=1 reports every ~60 s, so
-        this is purely a belt-and-braces safety net for fast startup sync and
-        for catching changes when the autonomous reports are delayed.
+        Each iteration is wrapped in try/except: this task is created via
+        ensure_future(), so an uncaught exception would kill it silently.
         """
         # Short initial delay so subscriptions are confirmed by the broker
         await asyncio.sleep(3.0)
-        await self.async_request_status()
+        loop = asyncio.get_running_loop()
+        next_status = 0.0
 
         while True:
-            await asyncio.sleep(self._STATUS_POLL_INTERVAL_S)
-            await self.async_request_status()
+            try:
+                await self.async_send_keepalive()
+                now = loop.time()
+                if now >= next_status:
+                    await self.async_request_status()
+                    next_status = now + self._STATUS_POLL_INTERVAL_S
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "PowerGlow %s: Fehler im Keepalive-/Status-Loop", self.api.sn
+                )
+            await asyncio.sleep(self._KEEPALIVE_INTERVAL_S)
+
+    async def async_send_keepalive(self) -> None:
+        """
+        Send cmd_id=97 keepalive, mirroring the device's own run state.
+
+        field2 carries the run state exactly like the EcoFlow cloud does
+        (1 = heating, absent = idle). We mirror the value the DEVICE last
+        reported (not the optimistic HA switch state) so the keepalive never
+        acts as a control command.
+        """
+        if self._mqtt_client is None:
+            return
+
+        from .proto import encode_powerglow_cmd97
+
+        raw = encode_powerglow_cmd97(self.api.sn, run_flag=self._reported_run_flag)
+        self._mqtt_client.publish_raw(self._mqtt_client._set_topic, raw)
 
     async def async_request_status(self) -> None:
         """
@@ -694,7 +731,18 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
 
         sn = self.api.sn
 
-        heating_power = payload.get("heatingPower")
+        # Decoded protobuf data arrives wrapped as {"params": {...}} (see mqtt.py);
+        # JSON payloads may be flat. Read raw device values from the right level.
+        raw_params = payload.get("params")
+        if not isinstance(raw_params, dict):
+            raw_params = payload
+
+        reported_run = raw_params.get("runFlag")
+        if reported_run is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                self._reported_run_flag = 1 if int(reported_run) else 0
+
+        heating_power = raw_params.get("heatingPower")
         if heating_power is not None:
             try:
                 if float(heating_power) > 0:
@@ -710,7 +758,7 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
         # The device reports mode as field25 (parsed as "mode" by proto.py).
         # When confirmed, update _actual_device_mode and clear the optimistic
         # _desired_state["mode"] so entities reflect the real device state.
-        reported_mode = payload.get("mode")
+        reported_mode = raw_params.get("mode")
         if reported_mode is not None:
             try:
                 mode_int = int(reported_mode)
