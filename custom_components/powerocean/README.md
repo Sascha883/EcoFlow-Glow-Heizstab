@@ -1,2 +1,0 @@
-# EcoFlow Glow Heizstab
-
