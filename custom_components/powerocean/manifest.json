@@ -12,5 +12,5 @@
     "paho-mqtt>=2.1.0",
     "protobuf>=4.21.0"
   ],
-  "version": "2.1.2"
+  "version": "2.1.3"
 }
