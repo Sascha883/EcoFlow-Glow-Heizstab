@@ -4,6 +4,31 @@ Alle wichtigen Änderungen an diesem Projekt werden hier dokumentiert.
 
 ---
 
+## [2.1.3] – 2026-10-19
+
+### Behoben
+- Release 2.1.2 enthielt eine fehlerhafte `__init__.py` – Setup schlug fehl mit „No setup or config entry setup function defined“. 2.1.3 enthält den korrekten, aufgeräumten Stand (Code identisch mit 2.1.2).
+
+## [2.1.2] – 2026-10-19
+
+### Neu
+- **Sensor-Typ für PV-Regelung** – Überschuss / Netz-Einspeisung / Netz-Bezug; bei Netzsensoren wird die eigene Heizleistung zurückgerechnet
+- **Mindestlaufzeit und Mindestpause** (Standard je 60 s)
+
+### Behoben
+- PV-Regelung schaltete bei Netzsensoren (z. B. GoodWe active_power) alle 10–20 s ein/aus
+- Leistung wird auf Rampenschritt abgerundet, bei Netzbezug sofort abgesenkt
+- Log-Spam: Zielleistungs-Befehle und Start-Probes nur noch auf DEBUG
+
+## [2.1.1] – 2026-10-18
+
+### Behoben
+- Heizleistung wurde ohne geöffnete EcoFlow-App nicht aktualisiert – Integration sendet jetzt selbst den App-Keepalive (alle 10 s) und fragt den Status alle 60 s ab
+- Schalter- und Modus-Abgleich las Werte aus der falschen Ebene der Nachricht
+- Hintergrund-Task stoppte bei einem Fehler unbemerkt
+
+---
+
 ## [2.1.0] – 2026-06-24
 
 ### Neu
