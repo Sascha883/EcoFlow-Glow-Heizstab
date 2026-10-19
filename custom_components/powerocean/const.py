@@ -72,4 +72,17 @@ PV_DEFAULT_CHECK_INTERVAL: int = 10  # s - Rampen-Intervall
 PV_DEFAULT_STARTUP_DELAY: int = 30   # s - Anlaufverzögerung nach HA-Start
 PV_DEFAULT_RAMP_STEP: int = 100      # W - Leistungsänderung pro Rampen-Schritt
 PV_DEFAULT_MAX_TEMP: int = 60        # °C - Abschalt-Temperatur PV-Betrieb
+CONF_PV_SENSOR_TYPE = "pv_sensor_type"
+CONF_PV_MIN_ON_TIME = "pv_min_on_time"
+CONF_PV_MIN_OFF_TIME = "pv_min_off_time"
+# Sensor-Typen für die PV-Regelung:
+#  surplus     – Sensor liefert bereits den verfügbaren Überschuss (inkl. Heizstab) → Ziel = Sensor
+#  grid_export – Netzleistung, positiv = Einspeisung (z. B. GoodWe active_power) → Ziel = Heizstab + Sensor
+#  grid_import – Netzleistung, positiv = Bezug (z. B. Shelly 3EM)               → Ziel = Heizstab − Sensor
+PV_SENSOR_TYPE_SURPLUS = "surplus"
+PV_SENSOR_TYPE_GRID_EXPORT = "grid_export"
+PV_SENSOR_TYPE_GRID_IMPORT = "grid_import"
+PV_DEFAULT_SENSOR_TYPE = PV_SENSOR_TYPE_SURPLUS   # rückwärtskompatibel
+PV_DEFAULT_MIN_ON_TIME: int = 60     # s - Mindestlaufzeit nach dem Einschalten
+PV_DEFAULT_MIN_OFF_TIME: int = 60    # s - Mindestpause nach dem Ausschalten
 PV_TEMP_HYSTERESIS: int = 5          # K  - Einschaltdifferenz (Wiedereinschalten bei max_temp - 5K)

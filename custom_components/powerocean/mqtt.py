@@ -201,16 +201,21 @@ class PowerGlowMqttClient:
                 cmd_func = info.get("cmd_func", 0)
 
                 # cmd_id=16 is the real ON/OFF control -> highlight it
-                if cmd_id == 16:
-                    # cmd_id=16 is the real control command (ON/OFF/Temp/Zeit) - keep WARNING
-                    _LOGGER.warning(
+                if cmd_id == 16 and "Zielleistung" in interp:
+                    # targetPower-Befehle kommen von der PV-Regelung alle paar Sekunden
+                    _LOGGER.debug(
+                        "  CLOUD cmd_id=16 -> %s  [seq=0x%x pdata=%s]",
+                        interp, seq, pdata_hex,
+                    )
+                elif cmd_id == 16:
+                    # cmd_id=16 is the real control command (ON/OFF/Temp/Zeit)
+                    _LOGGER.info(
                         "CLOUD ON/OFF cmd_id=16 -> %s  [seq=0x%x pdata=%s raw=%s]",
                         interp, seq, pdata_hex, raw.hex(),
                     )
                 elif cmd_func == 254:
                     # cmd_func=254: Smart Modus Schedule-Befehl (Temp/Zeit/Slots).
-                    # WARNING-level so we can analyse the protocol for smartTargetTemp.
-                    _LOGGER.warning(
+                    _LOGGER.info(
                         "  SMART-SCHEDULE cmd_func=254/cmd_id=%s -> %s  [seq=0x%x pdata=%s raw=%s]",
                         cmd_id, interp, seq, pdata_hex, raw.hex(),
                     )

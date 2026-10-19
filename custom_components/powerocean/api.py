@@ -211,7 +211,7 @@ class EcoflowApi:
                     code = body.get("code", "?")
                     data_val = body.get("data")
 
-                    LOGGER.warning(
+                    LOGGER.debug(
                         "PowerOcean probe %s/%s: HTTP %s | code=%s | data=%s | url=%s",
                         region, api_type, status, code,
                         "present" if data_val is not None else "null",
@@ -230,14 +230,14 @@ class EcoflowApi:
 
                     # code=0 aber data=null: vollstaendige Antwort loggen
                     if status == HTTP_OK and str(code) == "0":
-                        LOGGER.warning(
+                        LOGGER.debug(
                             "PowerOcean probe %s/%s: HTTP 200 code=0 aber data=null. "
                             "Vollstaendige Antwort: %s | url=%s",
                             region, api_type, body, url,
                         )
 
         except (TimeoutError, aiohttp.ClientError) as err:
-            LOGGER.warning(
+            LOGGER.debug(
                 "PowerOcean probe %s/%s NETWORK ERROR: %s | url=%s",
                 region, api_type, err, url,
             )
@@ -315,7 +315,7 @@ class EcoflowApi:
                             weak_host = host
                             weak_headers = hdrs
                             weak_api_type = api_type
-                            LOGGER.warning(
+                            LOGGER.debug(
                                 "Schwache Uebereinstimmung: region=%s host=%s "
                                 "api_type=%s (code=0, data=null). "
                                 "Geraet bekannt aber Datenformat unklar.",
@@ -326,7 +326,7 @@ class EcoflowApi:
             self.api_host = weak_host
             self._active_headers = weak_headers
             self._api_type = weak_api_type
-            LOGGER.warning(
+            LOGGER.debug(
                 "Verbinde mit schwacher Uebereinstimmung: host=%s api_type=%s. "
                 "Geraet antwortet mit code=0 aber data=null - "
                 "vollstaendige Antwort erscheint beim Datenabruf im Log.",

@@ -540,6 +540,7 @@ def decode_set_topic_packet(raw: bytes) -> dict[str, Any] | None:
                 f1 = pdata_fields.get(1)
                 f2 = pdata_fields.get(2)
                 f3 = pdata_fields.get(3)
+                f4 = pdata_fields.get(4)
                 f5 = pdata_fields.get(5)
                 if f1 == 0:
                     result["interpretation"] = "cmd_id=16: EIN-Befehl (field1=0) Geraet soll heizen"
@@ -556,6 +557,9 @@ def decode_set_topic_packet(raw: bytes) -> dict[str, Any] | None:
                     # Sets targetTemp: field3=raw → targetTemp=raw÷2°C
                     # Confirmed 2026-06-21: field3=68→34°C, field3=92→46°C
                     result["interpretation"] = f"cmd_id=16: Zieltemperatur field3={f3} → {f3 // 2}°C"
+                elif f4 is not None:
+                    # Sets targetPower: field4=N → N÷2 W (z. B. von der PV-Regelung)
+                    result["interpretation"] = f"cmd_id=16: Zielleistung field4={f4} → {f4 // 2} W"
                 elif f5 is not None:
                     # Sets Smart Modus target temperature: field5=N → smartTargetTemp=N÷2°C
                     # Same ×2 encoding as field3/targetTemp.

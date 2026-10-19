@@ -158,6 +158,9 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
         # Temperatursperre: True wenn Wasser-Solltemperatur erreicht.
         # Wird erst aufgehoben wenn temp <= (pv_max_temp - PV_TEMP_HYSTERESIS).
         self._pv_temp_blocked: bool = False
+        # Zeitpunkt (loop.time()) des letzten Ein-/Ausschaltens durch die PV-Regelung
+        # für Mindestlaufzeit / Mindestpause (gegen Takten).
+        self._pv_last_switch: float = 0.0
 
     async def _async_update_data(self) -> dict[str, float | int | str]:
         """Return last known MQTT data (or empty dict on first call)."""
@@ -799,8 +802,14 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
             CONF_PV_MAX_TEMP,
             CONF_PV_MIN_SURPLUS,
             CONF_PV_POWER_SENSOR,
+            CONF_PV_MIN_OFF_TIME,
+            CONF_PV_MIN_ON_TIME,
             CONF_PV_RAMP_STEP,
+            CONF_PV_SENSOR_TYPE,
             CONF_PV_STARTUP_DELAY,
+            PV_DEFAULT_MIN_OFF_TIME,
+            PV_DEFAULT_MIN_ON_TIME,
+            PV_DEFAULT_SENSOR_TYPE,
             PV_DEFAULT_CHECK_INTERVAL,
             PV_DEFAULT_MAX_POWER,
             PV_DEFAULT_MAX_TEMP,
@@ -829,6 +838,9 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
                 "check_interval": float(options.get(CONF_PV_CHECK_INTERVAL, PV_DEFAULT_CHECK_INTERVAL)),
                 "startup_delay": float(options.get(CONF_PV_STARTUP_DELAY, PV_DEFAULT_STARTUP_DELAY)),
                 "max_temp": int(options.get(CONF_PV_MAX_TEMP, PV_DEFAULT_MAX_TEMP)),
+                "sensor_type": str(options.get(CONF_PV_SENSOR_TYPE, PV_DEFAULT_SENSOR_TYPE)),
+                "min_on_time": float(options.get(CONF_PV_MIN_ON_TIME, PV_DEFAULT_MIN_ON_TIME)),
+                "min_off_time": float(options.get(CONF_PV_MIN_OFF_TIME, PV_DEFAULT_MIN_OFF_TIME)),
             }
         else:
             self._pv_config = {}
@@ -849,9 +861,12 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
             return
 
         LOGGER.info(
-            "PowerGlow %s: PV-Überschuss aktiv | sensor=%s min=%dW max=%dW rampe=%dW/%.0fs delay=%.0fs max_temp=%d°C",
+            "PowerGlow %s: PV-Überschuss aktiv | sensor=%s (%s, ein>=%.0fs aus>=%.0fs) min=%dW max=%dW rampe=%dW/%.0fs delay=%.0fs max_temp=%d°C",
             self.api.sn,
             self._pv_config["sensor"],
+            self._pv_config["sensor_type"],
+            self._pv_config["min_on_time"],
+            self._pv_config["min_off_time"],
             self._pv_config["min_surplus"],
             self._pv_config["max_power"],
             self._pv_config["ramp_step"],
@@ -911,12 +926,25 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
             return
 
         try:
-            surplus_w = float(state.state)
+            sensor_w = float(state.state)
         except (ValueError, TypeError):
             LOGGER.debug(
                 "PowerGlow %s: PV-Sensor ungültiger Wert: %s", self.api.sn, state.state
             )
             return
+
+        # ── Verfügbare Leistung je nach Sensor-Typ ─────────────────────────────
+        # Bei Netz-Sensoren enthält der Messwert die Leistung des Heizstabs
+        # bereits (Einspeisung sinkt / Bezug steigt, sobald er heizt). Ohne
+        # Rückrechnung schaltet sich die Regelung selbst wieder aus (Takten).
+        from .const import PV_SENSOR_TYPE_GRID_EXPORT, PV_SENSOR_TYPE_GRID_IMPORT
+        sensor_type = self._pv_config.get("sensor_type", "surplus")
+        if sensor_type == PV_SENSOR_TYPE_GRID_EXPORT:
+            surplus_w = self._pv_current_power + sensor_w
+        elif sensor_type == PV_SENSOR_TYPE_GRID_IMPORT:
+            surplus_w = self._pv_current_power - sensor_w
+        else:
+            surplus_w = sensor_w
 
         # ── Temperatursperre: Heizung pausieren wenn Solltemperatur erreicht ────────────────
         temp_key = f"{self.api.sn}_HEATING_ROD_PARAM_REPORT_temp"
@@ -953,7 +981,29 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
             desired_w = 0.0
         else:
             desired_w = float(min(surplus_w, max_power))
-            desired_w = round(desired_w / _PV_RAMP_STEP_W) * _PV_RAMP_STEP_W
+            # Abrunden (nicht runden): verhindert, dass die Regelung durch
+            # Aufrunden in den Netzbezug läuft und dann wieder zurückregelt.
+            desired_w = (desired_w // _PV_RAMP_STEP_W) * _PV_RAMP_STEP_W
+
+        # ── Mindestlaufzeit / Mindestpause (gegen Takten) ──────────────────────
+        now = asyncio.get_running_loop().time()
+        since_switch = now - self._pv_last_switch
+        is_on = self._pv_current_power > 0
+        if not self._pv_temp_blocked:
+            min_on = self._pv_config.get("min_on_time", 60.0)
+            min_off = self._pv_config.get("min_off_time", 60.0)
+            if not is_on and desired_w > 0 and since_switch < min_off:
+                LOGGER.debug(
+                    "PowerGlow %s: PV-Einschalten verzögert (Mindestpause %.0f/%.0fs)",
+                    self.api.sn, since_switch, min_off,
+                )
+                return
+            if is_on and desired_w <= 0 and since_switch < min_on:
+                LOGGER.debug(
+                    "PowerGlow %s: PV-Ausschalten verzögert (Mindestlaufzeit %.0f/%.0fs)",
+                    self.api.sn, since_switch, min_on,
+                )
+                desired_w = min(self._pv_current_power, float(_PV_RAMP_STEP_W))
 
         # Heizstab einschalten falls noch aus und Leistung > 0 geplant —
         # Leistungssteuerung erfolgt ausschließlich über targetPower.
@@ -964,12 +1014,17 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
             )
             await self.async_send_command({"runFlag": 1})
 
-        # ── Rampe: pro Schritt maximal ±ramp_step W in Richtung Ziel ───────────
+        # ── Rampe: hoch sanft (±ramp_step), runter sofort bei Netzbezug ───────
+        # Wenn der Überschuss kleiner als die aktuelle Leistung ist, bezieht der
+        # Heizstab bereits Netzstrom → direkt auf das Ziel absenken statt in
+        # 200-W-Schritten (sonst minutenlanger Netzbezug bei Wolken).
         delta = desired_w - self._pv_current_power
         if abs(delta) <= _PV_RAMP_STEP_W:
             new_power = desired_w
         elif delta > 0:
             new_power = self._pv_current_power + _PV_RAMP_STEP_W
+        elif surplus_w < self._pv_current_power:
+            new_power = desired_w
         else:
             new_power = self._pv_current_power - _PV_RAMP_STEP_W
 
@@ -978,9 +1033,12 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, float | int | str]]):
 
         # Nur senden wenn sich die Leistung tatsächlich ändert
         if new_power != self._pv_current_power:
+            if (new_power > 0) != is_on:
+                self._pv_last_switch = now
             LOGGER.debug(
-                "PowerGlow %s: PV-Rampe surplus=%.0fW desired=%.0fW current=%.0fW new=%.0fW delta=%.0fW",
+                "PowerGlow %s: PV-Rampe sensor=%.0fW surplus=%.0fW desired=%.0fW current=%.0fW new=%.0fW delta=%.0fW",
                 self.api.sn,
+                sensor_w,
                 surplus_w,
                 desired_w,
                 self._pv_current_power,

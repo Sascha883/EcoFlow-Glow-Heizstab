@@ -52,7 +52,10 @@ from .const import (
     CONF_PV_MAX_TEMP,
     CONF_PV_MIN_SURPLUS,
     CONF_PV_POWER_SENSOR,
+    CONF_PV_MIN_OFF_TIME,
+    CONF_PV_MIN_ON_TIME,
     CONF_PV_RAMP_STEP,
+    CONF_PV_SENSOR_TYPE,
     CONF_PV_STARTUP_DELAY,
     DEFAULT_NAME,
     DEFAULT_SCAN_INTERVAL,
@@ -64,8 +67,14 @@ from .const import (
     PV_DEFAULT_MAX_POWER,
     PV_DEFAULT_MAX_TEMP,
     PV_DEFAULT_MIN_SURPLUS,
+    PV_DEFAULT_MIN_OFF_TIME,
+    PV_DEFAULT_MIN_ON_TIME,
     PV_DEFAULT_RAMP_STEP,
+    PV_DEFAULT_SENSOR_TYPE,
     PV_DEFAULT_STARTUP_DELAY,
+    PV_SENSOR_TYPE_GRID_EXPORT,
+    PV_SENSOR_TYPE_GRID_IMPORT,
+    PV_SENSOR_TYPE_SURPLUS,
     PV_MAX_POWER,
     PowerOceanModel,
 )
@@ -379,6 +388,7 @@ class PowerOceanOptionsFlow(OptionsFlow):
         suggested = {
             CONF_PV_ENABLED:      options.get(CONF_PV_ENABLED,      False),
             CONF_PV_POWER_SENSOR: options.get(CONF_PV_POWER_SENSOR, None),
+            CONF_PV_SENSOR_TYPE:  options.get(CONF_PV_SENSOR_TYPE,  PV_DEFAULT_SENSOR_TYPE),
             CONF_PV_MAX_POWER:    current_max,
             CONF_PV_MIN_SURPLUS:  options.get(CONF_PV_MIN_SURPLUS,  PV_DEFAULT_MIN_SURPLUS),
             CONF_PV_MAX_TEMP:     options.get(CONF_PV_MAX_TEMP,     PV_DEFAULT_MAX_TEMP),
@@ -388,6 +398,18 @@ class PowerOceanOptionsFlow(OptionsFlow):
                 vol.Optional(CONF_PV_ENABLED): selector({"boolean": {}}),
                 vol.Optional(CONF_PV_POWER_SENSOR): selector(
                     {"entity": {"domain": "sensor", "device_class": "power"}}
+                ),
+                vol.Required(CONF_PV_SENSOR_TYPE): selector(
+                    {
+                        "select": {
+                            "options": [
+                                {"label": "Verfügbarer PV-Überschuss (inkl. Heizstab)", "value": PV_SENSOR_TYPE_SURPLUS},
+                                {"label": "Netzleistung – positiv = Einspeisung (z. B. GoodWe active_power)", "value": PV_SENSOR_TYPE_GRID_EXPORT},
+                                {"label": "Netzleistung – positiv = Bezug (z. B. Shelly 3EM)", "value": PV_SENSOR_TYPE_GRID_IMPORT},
+                            ],
+                            "mode": "dropdown",
+                        }
+                    }
                 ),
                 vol.Required(CONF_PV_MAX_POWER): selector(
                     {
@@ -447,6 +469,8 @@ class PowerOceanOptionsFlow(OptionsFlow):
             CONF_PV_RAMP_STEP:      options.get(CONF_PV_RAMP_STEP,      PV_DEFAULT_RAMP_STEP),
             CONF_PV_CHECK_INTERVAL: options.get(CONF_PV_CHECK_INTERVAL, PV_DEFAULT_CHECK_INTERVAL),
             CONF_PV_STARTUP_DELAY:  options.get(CONF_PV_STARTUP_DELAY,  PV_DEFAULT_STARTUP_DELAY),
+            CONF_PV_MIN_ON_TIME:    options.get(CONF_PV_MIN_ON_TIME,    PV_DEFAULT_MIN_ON_TIME),
+            CONF_PV_MIN_OFF_TIME:   options.get(CONF_PV_MIN_OFF_TIME,   PV_DEFAULT_MIN_OFF_TIME),
         }
         schema = vol.Schema(
             {
@@ -478,6 +502,28 @@ class PowerOceanOptionsFlow(OptionsFlow):
                             "min": 0,
                             "max": 300,
                             "step": 5,
+                            "unit_of_measurement": "s",
+                            "mode": "box",
+                        }
+                    }
+                ),
+                vol.Required(CONF_PV_MIN_ON_TIME): selector(
+                    {
+                        "number": {
+                            "min": 0,
+                            "max": 1800,
+                            "step": 10,
+                            "unit_of_measurement": "s",
+                            "mode": "box",
+                        }
+                    }
+                ),
+                vol.Required(CONF_PV_MIN_OFF_TIME): selector(
+                    {
+                        "number": {
+                            "min": 0,
+                            "max": 1800,
+                            "step": 10,
                             "unit_of_measurement": "s",
                             "mode": "box",
                         }
