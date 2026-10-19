@@ -1,0 +1,976 @@
+"""
+parser.py: EcoFlow API response parser for PowerOcean integration.
+
+This module provides the `EcoflowParser` class, which is responsible for
+parsing JSON responses from EcoFlow devices and converting them into
+structured PowerOcean endpoints and runtime sensor values.
+
+Key features:
+- `EcoflowParser.parse_structure()`: Extracts static device and sensor structure
+  without runtime values.
+- `EcoflowParser.parse_values()`: Extracts current sensor values from API responses.
+- Internal helpers for handling boxed devices (battery, wallbox), parallel
+  energy streams, heating rods, and EMS heartbeat data.
+- DeviceInfo resolution and unique endpoint ID generation.
+- Nested key extraction and Base64 SN decoding.
+
+The module interacts with:
+- `StructureCollector` and `ValueCollector` for collecting endpoint metadata
+  and runtime values.
+- `REPORT_DATAPOINTS` and `BOX_SCHEMAS` for schema-driven parsing.
+"""
+
+import base64
+import binascii
+from typing import Any, ClassVar
+
+import orjson
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.util.json import json_loads
+
+from .collector import ReportCollector, StructureCollector, ValueCollector
+from .const import (
+    DOMAIN,
+    LOGGER,
+    MODEL_NAME_MAP,
+    PowerOceanModel,
+)
+from .types import PowerOceanEndPoint, SensorMetaHelper
+from .utils import (
+    BOX_SCHEMAS,
+    REPORT_DATAPOINTS,
+    BoxSchema,
+    ReportMode,
+    _join_id,
+    clean_zero,
+    decode_version,
+)
+
+
+class EcoflowParser:
+    """Parses EcoFlow API responses into structured endpoints and runtime values."""
+
+    # Reports die ausschließlich PowerGlow-Daten enthalten
+    POWERGLOW_REPORTS = (
+        ReportMode.HEATING_ROD.value,
+        ReportMode.HEATING_ROD_ENERGY.value,
+    )
+
+    def __init__(self, variant: str, sn: str, powerglow_only: bool = False) -> None:
+        """
+        Initialize the parser for EcoFlow API responses.
+
+        Args:
+            variant: EcoFlow device variant / model ID.
+            sn: Serial number of the main PowerOcean device.
+            powerglow_only: If True, only heating-rod sensors are parsed.
+
+        """
+        self.ecoflow_variant = variant
+        self.sn = sn
+        self.sn_inverter = sn
+        self.powerglow_only = powerglow_only
+
+    # Public Methods
+    def parse_structure(self, response: dict) -> dict[str, PowerOceanEndPoint]:
+        """
+        Parse the EcoFlow API response and extract the static device structure.
+
+        Args:
+            response: The raw JSON response from the EcoFlow API.
+
+        Returns:
+            A dictionary mapping unique endpoint IDs to PowerOceanEndPoint objects,
+            representing the device and sensor structure without runtime values.
+
+        """
+        collector = StructureCollector()
+        self._walk_reports(response, collector)
+        return collector.endpoints
+
+    def parse_values(self, response: dict) -> dict[str, float | int | str]:
+        """
+        Parse the EcoFlow API response and extract current sensor values.
+
+        Args:
+            response: The raw JSON response from the EcoFlow API.
+
+        Returns:
+            A dictionary mapping unique endpoint IDs to their current values.
+
+        """
+        collector = ValueCollector()
+        self._walk_reports(response, collector)
+        return collector.values
+
+    # Internal Methods
+    def _walk_reports(self, response: dict, collector: ReportCollector) -> None:
+        # error handling for response
+        data = response.get("data")
+        if not isinstance(data, dict):
+            return
+
+        self.sn_inverter = self.sn
+
+        # PowerGlow-only: nur Heizstab-Reports verarbeiten, DEFAULT überspringen
+        if self.powerglow_only:
+            reports = list(self.POWERGLOW_REPORTS)
+            LOGGER.debug("PowerGlow-only mode: processing reports %s", reports)
+        else:
+            reports_data = list(REPORT_DATAPOINTS.keys())
+            reports = []
+
+            # Handle generic 'data' report
+            if ReportMode.DEFAULT.value in reports_data:
+                self._extract_sensors_from_report(
+                    response,
+                    report=ReportMode.DEFAULT.value,
+                    collector=collector,
+                )
+                reports = [r for r in reports_data if r != ReportMode.DEFAULT.value]
+                LOGGER.debug(f"Reports to look for: {reports}")
+
+        response_parallel = data.get("parallel")
+        response_quota = data.get("quota")
+
+        # Dual inverter installation
+        if response_parallel:
+            inverters = list(response_parallel.keys()) or [self.sn]
+
+            for element in inverters:
+                self.sn_inverter = element
+                response_base = response_parallel.get(element, {})
+                for report in reports:
+                    report_key = (
+                        ReportMode.PARALLEL.value
+                        if ReportMode.ENERGY_STREAM.value in report
+                        else report
+                    )
+
+                    self._extract_sensors_from_report(
+                        response_base,
+                        report_key,
+                        parallel_energy_stream_mode=ReportMode.PARALLEL.value
+                        in report_key,
+                        collector=collector,
+                    )
+        # Single inverter installation
+        elif response_quota:
+            response_base = response_quota
+            for report in reports:
+                self._extract_sensors_from_report(
+                    response_base,
+                    report,
+                    collector=collector,
+                )
+        elif self.powerglow_only:
+            # Eigenständiger PowerGlow via IoT-Service-API.
+            # Die Antwort hat kein 'quota'/'parallel', sondern direkt Modul-Keys
+            # wie z.B. 'ptc_heatdc' auf oberster Ebene von 'data'.
+            LOGGER.debug(
+                "No quota/parallel found – trying IoT standalone mode for SN %s. "
+                "data keys: %s",
+                self.sn,
+                list(data.keys()),
+            )
+            self._walk_iot_reports(data, collector)
+        else:
+            LOGGER.warning(
+                "Neither 'quota' nor 'parallel' inverter data found in response."
+            )
+        return
+
+    # -----------------------------------------------------------------
+    # IoT-Service API (eigenständige Geräte wie PowerGlow standalone)
+    # -----------------------------------------------------------------
+
+    # Bekannte Modul-Keys des EcoFlow IoT-API für den PowerGlow Heizstab.
+    # Die Reihenfolge entspricht der Priorität beim Durchsuchen.
+    _IOT_HEATING_ROD_KEYS = (
+        "ptc_heatdc",   # PTC Heating DC – wahrscheinlichster Key
+        "pv_heat_dc",
+        "heat_dc",
+        "heater",
+    )
+
+    def _walk_iot_reports(
+        self, data: dict[str, Any], collector: ReportCollector
+    ) -> None:
+        """
+        Parse an EcoFlow IoT-Service API response for standalone devices.
+
+        The IoT API returns data keyed by module name, e.g.:
+          {"ptc_heatdc": {"runFlag": 1, "targetTemp": 55, ...}}
+
+        If the exact module key is unknown, fall back to the first dict-valued
+        entry in *data* and log the full content for debugging.
+        """
+        device_info = self._make_device_info(
+            sn=self.sn,
+            prefix="PowerGlow",
+            model="PowerGlow",
+            via_sn=None,
+        )
+        report = ReportMode.HEATING_ROD.value
+
+        # 1. Bekannte Keys versuchen
+        module_data: dict[str, Any] | None = None
+        for key in self._IOT_HEATING_ROD_KEYS:
+            candidate = data.get(key)
+            if isinstance(candidate, dict) and candidate:
+                module_data = candidate
+                LOGGER.debug(
+                    "IoT: found heating rod data under key '%s' for SN %s",
+                    key,
+                    self.sn,
+                )
+                break
+
+        # 2. Fallback: erster dict-Wert in data
+        if module_data is None:
+            for key, val in data.items():
+                if isinstance(val, dict) and val:
+                    module_data = val
+                    LOGGER.debug(
+                        "IoT: no known key found – using first dict entry '%s' "
+                        "for SN %s. Full data keys: %s",
+                        key,
+                        self.sn,
+                        list(data.keys()),
+                    )
+                    break
+
+        # 3. Flat data (alle Werte direkt in data, ohne Modul-Schicht)
+        if module_data is None:
+            flat_values = {
+                k: v for k, v in data.items() if not isinstance(v, dict)
+            }
+            if flat_values:
+                module_data = flat_values
+                LOGGER.debug(
+                    "IoT: using flat data layout for SN %s. Keys: %s",
+                    self.sn,
+                    list(flat_values.keys()),
+                )
+
+        if module_data is None:
+            LOGGER.warning(
+                "IoT: no usable data found for SN %s. data keys: %s",
+                self.sn,
+                list(data.keys()),
+            )
+            return
+
+        LOGGER.debug(
+            "IoT: parsing %d fields for SN %s: %s",
+            len(module_data),
+            self.sn,
+            list(module_data.keys()),
+        )
+
+        # Bekannte Sensor-Keys aus den REPORT_DATAPOINTS übernehmen
+        known_keys = REPORT_DATAPOINTS.get(report, set())
+
+        for key, value in module_data.items():
+            # Nur bekannte Keys oder einfache Typen (int/float/str/bool)
+            if key in known_keys or isinstance(value, (int, float, str, bool)):
+                self._collect_sensor(
+                    collector=collector,
+                    device_sn=self.sn,
+                    report=report,
+                    key=key,
+                    value=value,
+                    device_info=device_info,
+                )
+
+    def _get_device_info(
+        self,
+        sn: str,
+        name: str,
+        model: str,
+        via_sn: str | None = None,
+    ) -> DeviceInfo:
+        info = DeviceInfo(
+            identifiers={(DOMAIN, sn)},
+            serial_number=sn,
+            name=name,
+            manufacturer="EcoFlow",
+            model=model,
+        )
+        if via_sn:
+            info["via_device"] = (DOMAIN, via_sn)
+        return info
+
+    def _parse_battery_data(self, raw_data: dict | str | None) -> dict | None:
+        if raw_data is None:
+            LOGGER.debug("Battery payload is None (no battery present)")
+            return None
+
+        if isinstance(raw_data, dict):
+            return raw_data
+
+        if isinstance(raw_data, str):
+            try:
+                data = json_loads(raw_data)
+            except orjson.JSONDecodeError as err:
+                LOGGER.warning("Failed to decode battery JSON: %s", err)
+                return None
+
+            if isinstance(data, dict):
+                return data
+
+            LOGGER.debug(
+                "Battery JSON decoded but is %s instead of dict",
+                type(data).__name__,
+            )
+            return None
+
+        LOGGER.debug(
+            "Unexpected battery payload type: %s",
+            type(raw_data).__name__,
+        )
+        return None
+
+    def _deep_get_by_key(self, data: Any, target_key: str) -> None:
+        """Search recursive for the occurrence of target_key in nested dict/list."""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                # Treffer
+                if key == target_key:
+                    return value
+
+                # Rekursiv tiefer suchen
+                result = self._deep_get_by_key(value, target_key)
+                if result is not None:
+                    return result
+
+        elif isinstance(data, list):
+            for item in data:
+                result = self._deep_get_by_key(item, target_key)
+                if result is not None:
+                    return result
+        return None
+
+    @staticmethod
+    def _get_nested_value(data: dict[str, Any], path: list[str]) -> Any | None:
+        current: Any = data
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
+
+    def _detect_box_schema(self, payload: dict) -> tuple[str, BoxSchema] | None:
+        for box_type, schema in BOX_SCHEMAS.items():
+            detect_fn = schema.get("detect")
+            if not callable(detect_fn):
+                continue  # Kein detect-Feld, überspringen
+            try:
+                if detect_fn(payload):
+                    return box_type, schema
+            except (KeyError, TypeError, AttributeError) as e:
+                # Loggen statt blind zu ignorieren
+                LOGGER.warning("Error detecting box schema for %s: %s", box_type, e)
+                continue
+        return None
+
+    def _extract_box_sn(
+        self, payload: dict[str, Any], schema: BoxSchema, fallback_sn: str
+    ) -> str | None:
+        path = schema.get("sn_path")
+
+        sn_value = self._get_nested_value(payload, path) if path else fallback_sn
+
+        # nur strings weitergeben
+        sn = sn_value if isinstance(sn_value, str) else None
+        if not sn:
+            return None
+
+        return self._decode_sn(sn)
+
+    def _extract_box_value(
+        self,
+        payload: dict,
+        key: str,
+        schema: BoxSchema,
+    ) -> str | None:
+        paths = schema.get("paths")
+        value = (
+            self._get_nested_value(payload, paths[key])
+            if paths and key in paths
+            else payload.get(key)
+        )
+
+        if value is None:
+            return None
+
+        if key.endswith("Sn") and isinstance(value, str):
+            return self._decode_sn(value)
+
+        return value
+
+    def _make_box_device_info(
+        self,
+        sn: str,
+        schema: BoxSchema,
+    ) -> DeviceInfo:
+        return self._make_device_info(
+            sn=sn,
+            prefix=schema["name_prefix"],
+            model=schema["model"],
+            via_sn=self.sn_inverter,
+        )
+
+    @staticmethod
+    def _is_matching_report(key: str, report: str) -> bool:
+        if not isinstance(key, str):
+            return False
+
+        # Spezialfall ENERGY_STREAM_REPORT
+        if report == ReportMode.ENERGY_STREAM.value:
+            return key.split("_", 1)[1] == report
+
+        # Default-Fall
+        return key.endswith(report)
+
+    def _decode_sn(self, value: str | None) -> str | None:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return base64.b64decode(value, validate=True).decode("utf-8").strip()
+        except binascii.Error:
+            LOGGER.warning("Invalid base64 string for SN: %s", value)
+            return value
+        except UnicodeDecodeError:
+            return value
+
+    def _resolve_device_info(
+        self,
+        payload: dict,
+    ) -> tuple[str, DeviceInfo]:
+        """Resolve serial number and DeviceInfo for non-boxed reports."""
+        # bekannte SN-Felder (Reihenfolge = Priorität)
+        sn_keys = ("evSn", "hrSn")
+
+        device_sn = self.sn_inverter
+        prefix = "PowerOcean"
+        model = MODEL_NAME_MAP[PowerOceanModel(self.ecoflow_variant)]
+        via_sn = None
+
+        for key in sn_keys:
+            raw_sn = payload.get(key)
+            if isinstance(raw_sn, str):
+                decoded = self._decode_sn(raw_sn)
+                if decoded:
+                    device_sn = decoded
+                    if key == "evSn":
+                        prefix = "Charger"
+                        model = "PowerOcean Charger"
+                    else:
+                        prefix = "PowerGlow"
+                        model = "PowerGlow"
+                    # via_sn nur setzen wenn das Gerät wirklich ein Sub-Gerät ist
+                    # (d.h. seine SN unterscheidet sich von der Wechselrichter-SN).
+                    # Bei eigenständigem PowerGlow ist sn_inverter == sn des PowerGlow
+                    # → kein Self-Loop im Device Registry.
+                    if device_sn != self.sn_inverter:
+                        via_sn = self.sn_inverter
+                    break
+
+        device_info = self._make_device_info(
+            sn=device_sn,
+            prefix=prefix,
+            model=model,
+            via_sn=via_sn,
+        )
+
+        return device_sn, device_info
+
+    def _make_device_info(
+        self, sn: str, prefix: str, model: str, via_sn: str | None = None
+    ) -> DeviceInfo:
+        info = DeviceInfo(
+            identifiers={(DOMAIN, sn)},
+            serial_number=sn,
+            name=f"{prefix} {sn}",
+            manufacturer="EcoFlow",
+            model=model,
+        )
+        if via_sn:
+            info["via_device"] = (DOMAIN, via_sn)
+        return info
+
+    def _collect_sensor(
+        self,
+        collector: ReportCollector,
+        device_sn: str,
+        report: str,
+        key: str,
+        value: Any,
+        device_info: DeviceInfo | None = None,
+    ) -> None:
+        unique_id = _join_id(device_sn, report, key)
+        collector.collect(
+            unique_id=unique_id,
+            device_sn=device_sn,
+            key=key,
+            value=value,
+            device_info=device_info,
+            name=f"{device_sn}_{key}",
+            friendly_name=f"{key}",
+        )
+
+    def _extract_sensors_from_report(
+        self,
+        response: dict[str, Any],
+        report: str,
+        *,
+        parallel_energy_stream_mode: bool = False,
+        collector: ReportCollector,
+    ) -> None:
+        """
+        Extract sensors from a given report in the EcoFlow API response.
+
+        Args:
+            response: The raw JSON response from the EcoFlow API.
+            report: The name of the report to extract from the JSON.
+            parallel_energy_stream_mode: If True, applies special handling
+                for parallel energy streams.
+            collector: A collector instance (StructureCollector or ValueCollector)
+                used to store extracted endpoints or values.
+
+        Notes:
+            Depending on the report type, different handlers may be invoked:
+            - Battery / Wallbox reports
+            - EMS heartbeat
+            - Heating rod energy stream
+            - Parallel energy streams
+            - Standard report processing
+
+        """
+        # Report-Key ggf. anpassen
+        report_to_log = report
+
+        key, d = next(
+            (
+                (k, v)
+                for k, v in response.items()
+                if self._is_matching_report(k, report)
+            ),
+            (None, None),
+        )
+        d = response.get(key) if key else None
+
+        if not isinstance(d, dict):
+            d = {}  # sicherstellen, dass wir ein dict haben
+
+        # --- EMS_CHANGE_REPORT + EMS_STATE_CHANGE_REPORT zusammenführen ---
+        if report == ReportMode.EMS_CHANGE.value:
+            # Keys für den "neuen" Report finden
+            ems_state_keys = [
+                k for k in response if k.endswith(ReportMode.EMS_STATE_CHANGE.value)
+            ]
+            for ems_key in ems_state_keys:
+                extra_data = response.get(ems_key)
+                if isinstance(extra_data, dict):
+                    # Keys behalten, die im REPORT_DATAPOINTS[EMS_CHANGE] definiert sind
+                    for k in REPORT_DATAPOINTS[ReportMode.EMS_CHANGE.value]:
+                        if k in extra_data:
+                            d[k] = extra_data[k]
+
+        if not isinstance(d, dict):
+            LOGGER.debug("Configured report '%s' not in response.", report_to_log)
+            return
+
+        sens_select = list(REPORT_DATAPOINTS.get(report, ()))
+        # Setze Report-Namen korrekt aus response
+        report = key or report
+        # Battery und Wallbox Handling
+        if ReportMode.BATTERY.value in report or ReportMode.WALLBOX.value in report:
+            self._handle_boxed_devices(
+                d,
+                report=report,
+                collector=collector,
+            )
+            return
+        # EMS Heartbeat Mode
+        if ReportMode.EMS.value in report:
+            self._handle_ems_heartbeat_mode(
+                d,
+                report,
+                sens_select,
+                collector=collector,
+            )
+            return
+
+        # Heating Rod Energy Stream Mode
+        if ReportMode.HEATING_ROD_ENERGY.value in report:
+            self._handle_heating_rod_energy_stream(
+                d,
+                report,
+                sens_select=sens_select,
+                collector=collector,
+            )
+            return
+
+        if ReportMode.WALLBOX_SYS.value in report:
+            self._handle_edev_device(
+                d,
+                report=report,
+                sens_select=sens_select,
+                collector=collector,
+            )
+            return
+
+        # Parallel Energy Stream Mode
+        if parallel_energy_stream_mode:
+            self._handle_parallel_energy_stream(
+                d,
+                report,
+                collector,
+            )
+        # Standardverarbeitung
+        self._handle_standard_mode(d, report, sens_select, collector=collector)
+
+    def _handle_boxed_devices(
+        self,
+        d: dict,
+        *,
+        report: str,
+        collector: ReportCollector,
+    ) -> None:
+        for box_sn_raw, raw_payload in d.items():
+            if box_sn_raw in ("", "updateTime"):
+                continue
+
+            payload = self._parse_battery_data(raw_payload)
+            if not isinstance(payload, dict):
+                continue
+
+            detected = self._detect_box_schema(payload)
+
+            if not detected:
+                LOGGER.debug("Unknown boxed device schema")
+                continue
+
+            # box_type wird aktuell nicht genutzt
+            _, schema = detected
+
+            device_sn = self._extract_box_sn(payload, schema, box_sn_raw)
+            if not device_sn:
+                continue
+
+            device_info = self._make_box_device_info(device_sn, schema)
+
+            for key in schema["sensors"]:
+                value = self._extract_box_value(payload, key, schema)
+                if value is None:
+                    continue
+
+                if key == "moduleAplSwVer" and isinstance(value, (int)):
+                    value = decode_version(value)
+                self._collect_sensor(
+                    collector=collector,
+                    device_sn=device_sn,
+                    report=report,
+                    key=key,
+                    value=value,
+                    device_info=device_info,
+                )
+
+    def _handle_ems_heartbeat_mode(
+        self,
+        d: dict,
+        report: str,
+        sens_select: list,
+        collector: ReportCollector,
+    ) -> None:
+        device_info = self._make_device_info(
+            sn=self.sn_inverter,
+            prefix="PowerOcean",
+            model=MODEL_NAME_MAP[PowerOceanModel(self.ecoflow_variant)],
+            via_sn=None,
+        )
+
+        # EMS Heartbeat: ggf. verschachtelte Strukturen, spezielle Behandlung
+        for key, value in d.items():
+            if key in sens_select:
+                self._collect_sensor(
+                    collector,
+                    self.sn_inverter,
+                    report,
+                    key,
+                    value,
+                    device_info=device_info,
+                )
+        # Besonderheiten Phasen
+        phases = ["pcsAPhase", "pcsBPhase", "pcsCPhase"]
+        if all(phase in d for phase in phases):
+            for phase in phases:
+                for key, value in d[phase].items():
+                    key_ext = f"{phase}_{key}"
+                    self._collect_sensor(
+                        collector,
+                        self.sn_inverter,
+                        report,
+                        key_ext,
+                        value,
+                        device_info=device_info,
+                    )
+
+        # Besonderheit mpptPv
+        if "mpptHeartBeat" in d:
+            mppt_data = d["mpptHeartBeat"][0]
+            report_mppt = f"{report}_mpptHeartBeat"
+
+            # Einzelne MPPT-Module
+            for i, mppt in enumerate(mppt_data["mpptPv"], start=1):
+                for key, value in mppt.items():
+                    key_ext = f"mpptPv{i}_{key}"
+                    self._collect_sensor(
+                        collector,
+                        self.sn_inverter,
+                        report_mppt,
+                        key_ext,
+                        value,
+                        device_info=device_info,
+                    )
+
+            # Gesamtleistung MPPT
+            total_power = sum(mppt.get("pwr", 0) for mppt in mppt_data["mpptPv"])
+            self._collect_sensor(
+                collector,
+                self.sn_inverter,
+                report_mppt,
+                "mpptPv_pwrTotal",
+                total_power,
+                device_info=device_info,
+            )
+
+            # Isolationswiderstand
+            mppt_ins_resist = mppt_data.get("mpptInsResist")
+            if mppt_ins_resist is not None:
+                self._collect_sensor(
+                    collector,
+                    self.sn_inverter,
+                    report_mppt,
+                    "mpptInsResist",
+                    mppt_ins_resist,
+                    device_info=device_info,
+                )
+
+            # ------------------------------
+            # Energy flows: grid, battery, solar, house
+            # ------------------------------
+
+            solar = max(float(total_power), 0.0)
+
+            # grid +- Werte in "pcsMeterPower", positiv = Import, negativ = Export
+            grid = float(d.get("pcsMeterPower", 0))
+
+            # battery +- Werte in "emsBpPower", positiv = Ladung, negativ = Entladung
+            battery = float(d.get("emsBpPower", 0))
+
+            # ------------------------------
+            # Vorzeichen normalisieren
+            # ------------------------------
+            grid_import = max(grid, 0.0)
+            grid_export = max(-grid, 0.0)
+
+            battery_charge = max(battery, 0.0)
+            battery_discharge = max(-battery, 0.0)
+
+            # ------------------------------
+            # Hausverbrauch (physikalische Bilanz)
+            # ------------------------------
+            house_consumption = solar + grid + battery_discharge - battery_charge
+            house_consumption = max(house_consumption, 0.0)
+
+            # ------------------------------
+            # SOLAR-Verteilung
+            # ------------------------------
+            solar_to_house = min(solar, house_consumption)
+
+            solar_surplus = solar - solar_to_house
+
+            solar_to_battery = min(solar_surplus, battery_charge)
+
+            solar_to_grid = solar_surplus - solar_to_battery
+
+            # ------------------------------
+            # BATTERIE-Flüsse
+            # ------------------------------
+            battery_to_house = max(battery_discharge, 0.0)
+
+            grid_to_battery = battery_charge - solar_to_battery
+
+            # ------------------------------
+            # NETZ-Flüsse
+            # ------------------------------
+            grid_to_house = grid_import - grid_to_battery
+
+            # Numerische Sicherheit
+            grid_to_house = max(grid_to_house, 0.0)
+            grid_to_battery = max(grid_to_battery, 0.0)
+            solar_to_grid = max(solar_to_grid, 0.0)
+
+            # ------------------------------
+            # Sensorliste
+            # ------------------------------
+            sensors = [
+                ("housePower", house_consumption),
+                ("gridPower", grid),
+                ("gridToBattery", grid_to_battery),
+                ("gridToHouse", grid_to_house),
+                ("batteryToHouse", battery_to_house),
+                ("solarToBattery", solar_to_battery),
+                ("solarToGrid", solar_to_grid),
+                ("solarToHouse", solar_to_house),
+            ]
+
+            for key, value in sensors:
+                self._collect_sensor(
+                    collector,
+                    self.sn_inverter,
+                    report_mppt,
+                    key,
+                    clean_zero(round(value, 1)),
+                    device_info=device_info,
+                )
+
+    def _handle_heating_rod_energy_stream(
+        self,
+        d: dict,
+        report: str,
+        sens_select: list,
+        collector: ReportCollector,
+    ) -> None:
+        """Handle heating rod energy stream extraction."""
+        stream_list = d.get("hrEnergyStream")
+        if not isinstance(stream_list, list):
+            return
+
+        for element in stream_list:
+            if not isinstance(element, dict):
+                continue
+
+            raw_sn = element.get("hrSn")
+            device_sn = self._decode_sn(raw_sn) if raw_sn else None
+            if not device_sn:
+                continue
+
+    # ------------------------------------------------------------------
+    # MQTT support for standalone PowerGlow devices
+    # ------------------------------------------------------------------
+
+    # Reverse-mapping: parameter key -> report type string.
+    # Built lazily from REPORT_DATAPOINTS on first use.
+    _MQTT_KEY_TO_REPORT: ClassVar[dict[str, str]] = {}
+
+    @classmethod
+    def _build_key_map(cls) -> None:
+        """Populate _MQTT_KEY_TO_REPORT from REPORT_DATAPOINTS (once)."""
+        if cls._MQTT_KEY_TO_REPORT:
+            return
+        for report_type, keys in REPORT_DATAPOINTS.items():
+            for key in keys:
+                # First writer wins (most specific report type)
+                cls._MQTT_KEY_TO_REPORT.setdefault(key, report_type)
+
+    def create_powerglow_endpoints(self) -> dict[str, PowerOceanEndPoint]:
+        """
+        Return a pre-defined set of PowerOceanEndPoint objects for a
+        standalone PowerGlow heating rod (MQTT-based device).
+
+        Sensors are created for all keys listed in REPORT_DATAPOINTS for
+        the HEATING_ROD and HEATING_ROD_ENERGY report types.  Values start
+        as None and are populated once the first MQTT message arrives.
+        """
+        from homeassistant.helpers.device_registry import DeviceInfo as _DeviceInfo
+
+        device_info = _DeviceInfo(
+            identifiers={(DOMAIN, self.sn)},
+            manufacturer="EcoFlow",
+            model="PowerGlow",
+            name="PowerGlow",
+        )
+
+        report_types = (
+            ReportMode.HEATING_ROD.value,
+            ReportMode.HEATING_ROD_ENERGY.value,
+        )
+
+        endpoints: dict[str, PowerOceanEndPoint] = {}
+        for report_type in report_types:
+            keys = REPORT_DATAPOINTS.get(report_type, set())
+            for key in sorted(keys):
+                uid = f"{self.sn}_{report_type}_{key}"
+                endpoint = PowerOceanEndPoint(
+                    internal_unique_id=uid,
+                    serial=self.sn,
+                    name=key,
+                    friendly_name=SensorMetaHelper.get_description(key),
+                    value=None,
+                    cls=SensorMetaHelper.get_class(key),
+                    description=SensorMetaHelper.get_description(key),
+                    icon=SensorMetaHelper.get_special_icon(key),
+                    device_info=device_info,
+                )
+                endpoints[uid] = endpoint
+
+        LOGGER.debug(
+            "create_powerglow_endpoints: created %d endpoints for SN %s",
+            len(endpoints), self.sn,
+        )
+        return endpoints
+
+    def parse_mqtt_payload(self, payload: dict) -> dict[str, float | int | str]:
+        """
+        Parse an EcoFlow MQTT message into coordinator-data format.
+
+        Handles the following known payload structures:
+          - {"data": {"typeCode": "...", "params": {...}}}
+          - {"params": {...}}
+          - Flat dict with known parameter keys
+
+        Returns a dict mapping endpoint unique-IDs to their values,
+        ready to be passed to async_set_updated_data().
+        """
+        self._build_key_map()
+
+        params = self._extract_mqtt_params(payload)
+        if not isinstance(params, dict):
+            LOGGER.warning(
+                "parse_mqtt_payload: unexpected format (no params dict): %s", payload
+            )
+            return {}
+
+        LOGGER.debug("PowerGlow MQTT parsed params: %s", params)
+
+        result: dict[str, float | int | str] = {}
+        for key, value in params.items():
+            if not isinstance(value, (int, float, str)):
+                continue
+            report_type = self._MQTT_KEY_TO_REPORT.get(
+                key, ReportMode.HEATING_ROD.value
+            )
+            uid = f"{self.sn}_{report_type}_{key}"
+            result[uid] = value
+
+        return result
+
+    @staticmethod
+    def _extract_mqtt_params(payload: dict) -> dict | None:
+        """Extract the parameter dict from various EcoFlow MQTT payload formats."""
+        # Format: {"data": {"params": {...}}} or {"data": {...}}
+        if "data" in payload and isinstance(payload["data"], dict):
+            inner = payload["data"]
+            params = inner.get("params")
+            return params if isinstance(params, dict) else inner
+
+        # Format: {"params": {...}}
+        if "params" in payload and isinstance(payload["params"], dict):
+            return payload["params"]
+
+        # Flat format: {"key": value, ...}
+        return payload
